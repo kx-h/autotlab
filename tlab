@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  tlab —— 傻瓜式训练管理 (Train Lab)
+#
+#  每次训练只需三步:
+#    1. tlab new  <项目名> -m "备注"      # 建项目: 同名文件夹 + note.md
+#    2. tlab run  <项目名> '<训练命令>'   # 自动后台运行, 断SSH/关电脑都不受影响
+#    3. tlab list                        # 随时看总览
+#
+#  常用命令: tlab log / status / note / stop / enter / path / rm
+#  项目根目录: $TLAB_HOME/tlab-projects (TLAB_HOME 默认 /root/autodl-tmp)
+# =============================================================================
+set -u
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+# TLAB_HOME: 项目根目录所在位置。
+# 优先用环境变量指定的路径; 未指定则自动探测: 存在 AutoDL 数据盘就用它, 否则用家目录。
+if [[ -z "${TLAB_HOME:-}" ]]; then
+    if [[ -d /root/autodl-tmp ]]; then
+        TLAB_HOME="/root/autodl-tmp"
+    else
+        TLAB_HOME="${HOME:-/root}"
+    fi
+fi
+TLAB_ROOT="${TLAB_HOME}/tlab-projects"
+
+C_G=$'\033[1;32m'; C_R=$'\033[1;31m'; C_Y=$'\033[1;33m'; C_D=$'\033[2m'; C_0=$'\033[0m'
+info() { echo -e "${C_G}[tlab]${C_0} $*"; }
+warn() { echo -e "${C_Y}[tlab]${C_0} $*"; }
+die()  { echo -e "${C_R}[tlab] 错误${C_0}: $*" >&2; exit 1; }
+
+# ---------- 工具函数 ----------
+pad() { # pad <字符串> <显示宽度>: 中文按 2 列补齐, 保证对齐
+    local s="$1" w="${2:-0}" out="" ch bytes cur=0 i
+    while IFS= read -r -n1 ch; do
+        [[ -z "$ch" ]] && continue
+        bytes=$(LC_ALL=C printf %s "$ch" | wc -c)
+        out+="$ch"
+        (( bytes == 1 )) && cur=$((cur+1)) || cur=$((cur+2))
+    done <<< "$s"
+    printf '%s' "$out"
+    for (( i=cur; i<w; i++ )); do printf ' '; done
+}
+
+name_check() {
+    local n="$1"
+    [[ -n "$n" ]] || die "项目名不能为空"
+    [[ "$n" != "." && "$n" != ".." && "$n" != */* && "$n" != *[[:space:]]* ]] \
+        || die "项目名不能包含空格或斜杠: '$n'"
+}
+
+proj_dir()    { echo "$TLAB_ROOT/$1"; }
+require_proj() { local d; d="$(proj_dir "$1")"; [[ -d "$d" ]] || die "项目不存在: '$1' (先运行 tlab new $1)"; echo "$d"; }
+
+# 判断训练是否在跑 (pid 存在 + 非僵尸)
+is_running() {
+    local f="$1/.tlab.pid" p
+    [[ -f "$f" ]] || return 1
+    p="$(cat "$f" 2>/dev/null)"
+    [[ "$p" =~ ^[0-9]+$ ]] || return 1
+    [[ -e "/proc/$p" ]] || return 1
+    [[ "$(awk '{print $3}' "/proc/$p/stat" 2>/dev/null)" != "Z" ]] || return 1
+    return 0
+}
+
+latest_mtime() { find "$1" -maxdepth 2 -type f -printf '%T@\n' 2>/dev/null | sort -rn | head -n1; }
+
+# ---------- 子命令 ----------
+cmd_new() {
+    [[ $# -ge 1 ]] || die "用法: tlab new <项目名> [-m \"备注\"]"
+    local name="$1" note=""; shift
+    name_check "$name"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -m|--note) [[ $# -ge 2 ]] || die "-m 后面需要备注内容"; note="$2"; shift 2 ;;
+            *) die "未知参数: $1" ;;
+        esac
+    done
+    local d="$TLAB_ROOT/$name"
+    [[ -e "$d" ]] && die "项目已存在: '$name'"
+    mkdir -p "$d/logs" || die "无法创建目录 $d"
+    {
+        echo "# $name"
+        echo ""
+        echo "- 创建时间: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "- 目录: $d"
+        [[ -n "$note" ]] && { echo ""; echo "## $(date '+%Y-%m-%d %H:%M:%S')"; echo ""; echo "$note"; }
+    } > "$d/note.md"
+    info "项目已创建: $name"
+    echo "  启动训练: ${C_G}tlab run $name '<训练命令>'${C_0}"
+    echo "  追加备注: tlab note $name '备注内容'"
+}
+
+cmd_run() {
+    [[ $# -ge 2 ]] || die "用法: tlab run <项目名> '<训练命令>'\n  提示: 命令整体用引号包住, 例如: tlab run demo 'python train.py --lr 0.1'"
+    local name="$1" cmd; shift
+    name_check "$name"
+    local d; d="$(require_proj "$name")"
+    cmd="$*"
+    if is_running "$d"; then
+        die "项目 '$name' 已有训练在跑 (PID $(cat "$d/.tlab.pid"))。先 'tlab stop $name' 停止"
+    fi
+
+    local ts; ts="$(date '+%Y%m%d-%H%M%S')"
+    local logf="$d/logs/run-$ts.log"
+    local runsh="$d/run.sh"
+
+    # 命令原样写入 cmd.sh (独立文件, 不经过任何转义/引号拼接, 支持多行命令)
+    cat > "$d/cmd.sh" <<WRAP
+$cmd
+WRAP
+    # 生成静态包装脚本 (引号定界符, 不做任何变量展开)
+    cat > "$runsh" <<'WRAP'
+#!/usr/bin/env bash
+# 由 tlab 自动生成
+cd "$TLAB_PROJ_DIR" || exit 1
+echo "=================================================="
+echo " 项目: $TLAB_PROJ_NAME"
+echo " 目录: $(pwd)"
+echo " 命令:"
+sed 's/^/   /' "$TLAB_PROJ_DIR/cmd.sh"
+echo " 开始: $(date '+%F %T')"
+echo "=================================================="
+bash "$TLAB_PROJ_DIR/cmd.sh"
+rc=$?
+echo "=================================================="
+echo " 结束: $(date '+%F %T') | 退出码: $rc"
+echo "=================================================="
+rm -f "$TLAB_PROJ_DIR/.tlab.pid"
+exit $rc
+WRAP
+    chmod +x "$runsh"
+    cp "$runsh" "$d/logs/run-$ts.sh"   # 本次运行脚本留档, 方便复现
+    cp "$d/cmd.sh" "$d/logs/run-$ts.cmd.sh"
+
+    cd "$d" || die "无法进入 $d"
+    # setsid: 新会话+新进程组, 彻底脱离终端 -> SSH断开不会被内核发 SIGHUP
+    # nohup: 即使收到 SIGHUP 也忽略 -> 双保险
+    TLAB_PROJ_DIR="$d" TLAB_PROJ_NAME="$name" setsid nohup bash "$runsh" > "$logf" 2>&1 < /dev/null &
+    local pid=$!
+    echo "$pid" > "$d/.tlab.pid"
+    date '+%F %T' > "$d/.tlab.started"
+    ln -sfn "logs/run-$ts.log" "$d/run.log"
+    disown "$pid" 2>/dev/null || true
+    sleep 0.3
+    if ! kill -0 "$pid" 2>/dev/null; then
+        if grep -q '退出码:' "$logf" 2>/dev/null; then
+            info "命令瞬间执行完毕: $(grep '退出码:' "$logf" | tail -1)"
+            rm -f "$d/.tlab.pid"
+            return 0
+        fi
+        warn "启动失败, 日志如下:"
+        tail -n 15 "$logf" >&2
+        rm -f "$d/.tlab.pid"
+        exit 1
+    fi
+    info "已在后台启动 ✓  项目: $name  (PID $pid)"
+    echo "  日志: $d/run.log"
+    echo "  追看: tlab log $name      状态: tlab status $name"
+    echo "  停止: tlab stop $name     总览: tlab list"
+}
+
+cmd_stop() {
+    local d; d="$(require_proj "$1")"
+    local pidf="$d/.tlab.pid"
+    [[ -f "$pidf" ]] || { warn "没有正在运行的训练: $1"; return 0; }
+    local pid; pid="$(cat "$pidf")"
+    if ! is_running "$d"; then
+        info "进程已不在: $1"; rm -f "$pidf"; return 0
+    fi
+    info "向 PID $pid 发送 SIGTERM (含其子进程) ..."
+    kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null
+    local i
+    for i in {1..10}; do
+        is_running "$d" || break
+        sleep 1
+    done
+    if is_running "$d"; then
+        warn "10 秒未退出, 强制 SIGKILL ..."
+        kill -9 -- "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null
+    fi
+    rm -f "$pidf"
+    info "已停止: $1"
+}
+
+cmd_status() {
+    local d; d="$(require_proj "$1")"
+    if is_running "$d"; then
+        info "${C_G}● 运行中${C_0}  PID: $(cat "$d/.tlab.pid")  启动于: $(cat "$d/.tlab.started" 2>/dev/null)"
+    else
+        warn "○ 未运行"
+    fi
+    if [[ -e "$d/run.log" ]]; then
+        echo "---- 最新日志最后 10 行 ----"
+        tail -n 10 "$d/run.log"
+    fi
+}
+
+cmd_log() {
+    local d; d="$(require_proj "$1")"
+    [[ -e "$d/run.log" ]] || die "暂无日志, 先运行: tlab run $1 '<命令>'"
+    if [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]]; then
+        tail -n "$2" "$d/run.log"
+    else
+        echo "(按 Ctrl+C 退出只中断查看, 不影响训练)"
+        tail -n 40 -f "$d/run.log"
+    fi
+}
+
+cmd_note() {
+    local d; d="$(require_proj "$1")"
+    if [[ $# -ge 2 ]]; then
+        printf '\n## %s\n\n%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${*:2}" >> "$d/note.md"
+        info "备注已追加 → $d/note.md"
+    else
+        cat "$d/note.md"
+    fi
+}
+
+cmd_list() {
+    mkdir -p "$TLAB_ROOT"
+    local d found=0
+    for d in "$TLAB_ROOT"/*/; do [[ -d "$d" ]] && { found=1; break; }; done
+    if [[ $found -eq 0 ]]; then
+        echo "还没有任何项目, 三步开始:"
+        echo "  ${C_G}1. tlab new <项目名> -m '备注'${C_0}"
+        echo "  ${C_G}2. tlab run <项目名> '<训练命令>'${C_0}"
+        echo "  ${C_G}3. tlab list${C_0}"
+        return 0
+    fi
+    local -a dirs=()
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && dirs+=("$line")
+    done < <(
+        for d in "$TLAB_ROOT"/*/; do
+            [[ -d "$d" ]] || continue
+            m="$(find "$d" -maxdepth 2 -type f -printf '%T@\n' 2>/dev/null | sort -rn | head -n1)"
+            echo "${m:-0}|${d%/}"
+        done | sort -t'|' -k1,1rn | cut -d'|' -f2-
+    )
+    echo ""
+    printf '%s %s %s %s\n' "$(pad 状态 8)" "$(pad 项目 24)" "$(pad 最后修改 17)" "备注"
+    echo "-------------------------------------------------------------------------"
+    for d in "${dirs[@]}"; do
+        local name="${d##*/}" stv stc m mstr note
+        if is_running "$d"; then stv="运行中"; stc="$C_G"; else stv="停止"; stc="$C_D"; fi
+        m="$(latest_mtime "$d")"
+        mstr=""
+        [[ -n "$m" ]] && mstr="$(date -d "@${m%.*}" '+%Y-%m-%d %H:%M')"
+        note=""
+        [[ -f "$d/note.md" ]] && note="$(awk '/^## /{f=1; next} f && NF {print; exit}' "$d/note.md")"
+        note="${note:0:48}"
+        printf '%s %s %s %s\n' "${stc}$(pad "$stv" 8)${C_0}" "$(pad "$name" 24)" "$(pad "$mstr" 17)" "$note"
+    done
+    echo ""
+    echo "看日志: tlab log <项目> | 看备注: tlab note <项目> | 停止: tlab stop <项目> | 进入: tlab enter <项目>"
+}
+
+cmd_enter() {
+    local d; d="$(require_proj "$1")"
+    cd "$d" || die "无法进入 $d"
+    echo "已进入: $d  (输入 exit 返回)"
+    exec "${SHELL:-bash}"
+}
+
+cmd_path() { local d; d="$(require_proj "$1")"; echo "$d"; }
+
+cmd_rm() {
+    local d; d="$(require_proj "$1")"
+    if is_running "$d"; then die "训练还在运行, 先 'tlab stop $1'"; fi
+    read -r -p "确认删除项目 '$1' 及其全部数据? 输入 yes: " ans
+    [[ "$ans" == "yes" ]] || { echo "已取消"; return 0; }
+    rm -rf "$d" && info "已删除: $1"
+}
+
+cmd_install() {
+    mkdir -p /usr/local/bin
+    chmod +x "$SCRIPT_PATH"
+    ln -sf "$SCRIPT_PATH" /usr/local/bin/tlab
+    info "已安装 → /usr/local/bin/tlab"
+    echo "  若以后系统盘重置, 重新执行: bash $SCRIPT_PATH install"
+}
+
+usage() {
+    cat <<'EOF'
+tlab —— 傻瓜式训练管理
+  1. 命名+备注+隔离: tlab new <项目名> -m "备注"   (创建同名文件夹+note.md)
+  2. 一键后台运行:    tlab run <项目名> '<训练命令>' (自动 cd 进项目目录, 自动后台)
+  3. 总览:            tlab list
+
+命令:
+  new    <项目名> [-m "备注"]   新建项目
+  run    <项目名> '<命令>'      后台运行训练 (断SSH/本地关机都不影响)
+  list                          总览: 状态/备注/最后修改时间
+  status <项目名>               运行状态 + 日志末尾
+  log    <项目名> [行数]        跟随最新日志; 带行数则只看最后N行
+  note   <项目名> ["内容"]      查看备注; 带内容则追加一条带时间戳的备注
+  stop   <项目名>               停止训练 (先 TERM 后 KILL)
+  enter  <项目名>               进入项目目录的交互 shell
+  path   <项目名>               打印项目绝对路径
+  rm     <项目名>               删除项目 (需确认)
+  install                       安装/恢复 tlab 到 /usr/local/bin
+  help                          本帮助
+
+项目根目录: ${TLAB_HOME}/tlab-projects   (可用环境变量 TLAB_HOME 修改)
+EOF
+}
+
+# ---------- 入口 ----------
+main() {
+    [[ $# -ge 1 ]] || { usage; echo ""; cmd_list; exit 0; }
+    case "$1" in
+        new)      shift; cmd_new "$@" ;;
+        run)      shift; cmd_run "$@" ;;
+        list|ls)  shift; cmd_list ;;
+        status|st) shift; [[ $# -ge 1 ]] || die "用法: tlab status <项目名>"; cmd_status "$1" ;;
+        log)      shift; [[ $# -ge 1 ]] || die "用法: tlab log <项目名> [行数]"; cmd_log "$@" ;;
+        note)     shift; [[ $# -ge 1 ]] || die "用法: tlab note <项目名> [备注内容]"; cmd_note "$@" ;;
+        stop)     shift; [[ $# -ge 1 ]] || die "用法: tlab stop <项目名>"; cmd_stop "$1" ;;
+        enter)    shift; [[ $# -ge 1 ]] || die "用法: tlab enter <项目名>"; cmd_enter "$1" ;;
+        path)     shift; [[ $# -ge 1 ]] || die "用法: tlab path <项目名>"; cmd_path "$1" ;;
+        rm)       shift; [[ $# -ge 1 ]] || die "用法: tlab rm <项目名>"; cmd_rm "$1" ;;
+        install)  cmd_install ;;
+        help|-h|--help) usage ;;
+        *) usage; die "未知命令: $1" ;;
+    esac
+}
+main "$@"
